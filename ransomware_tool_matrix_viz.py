@@ -5,13 +5,14 @@ import uuid
 import os
 import requests
 import re
-import plotly.express as px  # Added for advanced charting
+import time  # Added for rate limiting
+import plotly.express as px
 from datetime import datetime
 from streamlit_agraph import agraph, Node, Edge, Config
 
 # --- Configuration & Setup ---
 st.set_page_config(
-    page_title="Ransomware Tool Matrix Visualiser",
+    page_title="Ransomware Tool Matrix Viz",
     page_icon="☠️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -40,11 +41,11 @@ ATTACK_PATTERN_NAMES = [
 
 # Category Markdowns
 CATEGORY_URLS = {
-    "Discovery": f"{REPO_BASE}/Tools/Discovery.md",
+    "Discovery": f"{REPO_BASE}/Tools/DiscoveryEnum.md",
     "RMM Tools": f"{REPO_BASE}/Tools/RMM-Tools.md",
     "Defense Evasion": f"{REPO_BASE}/Tools/DefenseEvasion.md",
     "Credential Theft": f"{REPO_BASE}/Tools/CredentialTheft.md",
-    "OffSec": f"{REPO_BASE}/Tools/OffSec.md",
+    "OffSec": f"{REPO_BASE}/Tools/Offsec.md",
     "Networking": f"{REPO_BASE}/Tools/Networking.md",
     "LOLBAS": f"{REPO_BASE}/Tools/LOLBAS.md",
     "Exfiltration": f"{REPO_BASE}/Tools/Exfiltration.md"
@@ -69,6 +70,17 @@ def normalize_string(s):
     if not isinstance(s, str): return ""
     return re.sub(r'[^a-z0-9]', '', s.lower())
 
+def clean_group_name(name):
+    """Clean group names (remove 's Tools, asterisks, etc.)"""
+    if not name: return ""
+    # Clean markdown links [Name](url) -> Name
+    name = re.sub(r'\[([^\]]+)\]\(.*?\)', r'\1', name)
+    # Remove 's Tools (case insensitive)
+    name = re.sub(r"['’]s\s+Tools?", "", name, flags=re.IGNORECASE)
+    # Remove trailing/leading asterisks, spaces, or dashes
+    name = name.replace("*", "").strip().strip("-").strip()
+    return name
+
 def is_valid_tool_name(name):
     """Filter out URLs, Dates, and Junk data from tool names"""
     if not name: return False
@@ -87,7 +99,7 @@ def is_valid_tool_name(name):
     
     if len(n) > 60: return False
     
-    if n.lower() in ["tool", "tool name", "name", "unknown", "description", "category", "date published", "report"]: return False
+    if n.lower() in ["tool", "tool name", "name", "unknown", "description", "category", "date published", "report", "software"]: return False
     
     return True
 
@@ -158,8 +170,10 @@ class DataStore:
         if existing_id:
             for t in self.data['tools']:
                 if t['id'] == existing_id:
+                    # Update description only if new one is longer/better
                     if description and len(description) > len(t.get('description', '')): 
                         t['description'] = description
+                    # Update type if current is Unknown
                     if type_ and type_ != "Unknown" and t.get('type') == "Unknown": 
                         t['type'] = type_
             return existing_id
@@ -188,7 +202,13 @@ class DataStore:
             tool_ids.extend(known_tool_ids)
             
         if group:
-            if description: group['description'] = description
+            # Update description only if the new one is substantial and current is generic
+            if description and len(description) > 10 and "Auto-extracted" not in description:
+                 group['description'] = description
+            elif not group.get('description') and description:
+                 group['description'] = description
+                 
+            # Merge tools (Set Logic to avoid duplicates)
             existing_tools = set(group.get('tools', []))
             existing_tools.update(tool_ids)
             group['tools'] = list(existing_tools)
@@ -236,28 +256,102 @@ class GitHubIngestor:
 
     def fetch_category_markdowns(self):
         count = 0
+        new_groups_created = 0
+        
         for cat_name, url in CATEGORY_URLS.items():
+            # Delay to respect rate limits/avoid throttling
+            time.sleep(0.5)
+            
             try:
                 resp = requests.get(url)
                 if resp.status_code == 200:
                     lines = resp.text.split('\n')
+                    
+                    # Header detection logic
+                    header_map = {}
+                    start_processing = False
+                    
                     for line in lines:
-                        if line.strip().startswith('|') and '---' not in line:
-                            parts = [p.strip() for p in line.split('|')]
-                            if len(parts) >= 3:
-                                tool_name = parts[1]
-                                desc = parts[2] if len(parts) > 2 else ""
-                                if store.upsert_tool(tool_name, cat_name, desc):
-                                    count += 1
+                        clean_line = line.strip()
+                        if not clean_line.startswith('|'): continue
+                        
+                        # Check if it's the separator line
+                        if "---" in clean_line:
+                            start_processing = True
+                            continue
+                            
+                        parts = [p.strip() for p in clean_line.strip('|').split('|')]
+                        
+                        # Identify Header Row
+                        if not start_processing:
+                            # Map columns based on keywords
+                            temp_map = {}
+                            for idx, col in enumerate(parts):
+                                col_lower = col.lower()
+                                if "tool" in col_lower: temp_map['tool'] = idx
+                                if "desc" in col_lower: temp_map['desc'] = idx
+                                if any(x in col_lower for x in ["group", "adversary", "usage", "attribution"]): 
+                                    temp_map['group'] = idx
+                            
+                            # If we found a 'tool' column, this is likely the header
+                            if 'tool' in temp_map:
+                                header_map = temp_map
+                            continue
+                        
+                        # Process Data Rows
+                        if start_processing and 'tool' in header_map:
+                            if len(parts) > header_map['tool']:
+                                raw_tool_name = parts[header_map['tool']]
+                                # Remove links [Name](url) -> Name
+                                tool_name = re.sub(r'\[([^\]]+)\]\(.*?\)', r'\1', raw_tool_name).strip()
+                                
+                                if is_valid_tool_name(tool_name):
+                                    # Extract Description
+                                    desc = ""
+                                    if 'desc' in header_map and len(parts) > header_map['desc']:
+                                        desc = parts[header_map['desc']]
+                                    
+                                    # Upsert Tool (Create tool relationship to category)
+                                    tool_id = store.upsert_tool(tool_name, cat_name, desc)
+                                    
+                                    if tool_id:
+                                        count += 1
+                                        
+                                        # Process Groups in the "Threat Group Usage" column
+                                        if 'group' in header_map and len(parts) > header_map['group']:
+                                            group_cell = parts[header_map['group']]
+                                            # Clean cell: remove links inside cell
+                                            group_cell = re.sub(r'\[([^\]]+)\]\(.*?\)', r'\1', group_cell)
+                                            
+                                            if group_cell and len(group_cell) > 2:
+                                                # Split by common delimiters (comma, semi-colon, 'and', newlines)
+                                                raw_groups = re.split(r'[,;]|\s+and\s+|\n', group_cell)
+                                                
+                                                for rg in raw_groups:
+                                                    clean_grp = clean_group_name(rg)
+                                                    
+                                                    # Validate Group Name
+                                                    if clean_grp and len(clean_grp) > 2 and clean_grp.lower() not in ["unknown", "various", "none", "-", "n/a", "groups"]:
+                                                        # CREATE/UPDATE GROUP and LINK TOOL
+                                                        # This ensures missing groups like "Lapsus$" or "Storm-0501" are created
+                                                        store.upsert_group(
+                                                            name=clean_grp,
+                                                            description=f"Auto-extracted from {cat_name} matrix.",
+                                                            tool_names=[],
+                                                            known_tool_ids=[tool_id]
+                                                        )
+                                                        new_groups_created += 1
+
             except Exception as e:
                 print(f"Failed {cat_name}: {e}")
-        return f"Scraped {count} tools from Category Markdowns."
+        return f"Scraped {count} tools. Created/Updated {new_groups_created} group links from category tables."
 
     def fetch_group_profiles(self):
         count = 0
         all_tools = store.get_tools()
         
         for url in GROUP_PROFILE_URLS:
+            time.sleep(0.5) # Rate limiting
             try:
                 resp = requests.get(url)
                 if resp.status_code == 200:
@@ -266,7 +360,7 @@ class GitHubIngestor:
                     group_name = "Unknown Group"
                     header_match = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
                     if header_match:
-                        group_name = header_match.group(1).strip()
+                        group_name = clean_group_name(header_match.group(1))
                     else:
                         group_name = url.split('/')[-1].replace('.md', '')
 
@@ -559,7 +653,7 @@ def generate_stix_bundle(export_scope="All", selected_ids=None):
 # --- UI Components ---
 
 def sidebar():
-    st.sidebar.title("☠️ Ransomware Tool Matrix")
+    st.sidebar.title("Ransomware Tool Matrix Viz ☠️")
     
     # Inject Professional Theme
     inject_custom_css()
@@ -584,7 +678,7 @@ def sidebar():
             msg1 = ingestor.fetch_all_tools_csv()
             st.write(msg1)
             
-            st.write("Scraping Category Markdowns...")
+            st.write("Scraping Category Markdowns & Parsing Groups...")
             msg2 = ingestor.fetch_category_markdowns()
             st.write(msg2)
             
@@ -715,7 +809,7 @@ def render_dashboard():
             st.info("No relationships found in current selection.")
 
 def render_visualizer():
-    st.title("Ransomware Tool Matrix Visualiser")
+    st.title("Ransomware Tool Matrix Graph ☠️")
     
     groups = store.get_groups()
     tools = store.get_tools()
@@ -877,11 +971,41 @@ def render_tools():
                     st.error("Invalid Tool Name (URL, Date, or Junk detected)")
 
     tools = store.get_tools()
-    df = pd.DataFrame(tools)
-    if not df.empty:
+    groups = store.get_groups()
+    
+    # --- Filters ---
+    with st.expander("🔎 Filter Data", expanded=True):
+        col1, col2 = st.columns(2)
+        filter_tool_name = col1.text_input("Filter by Tool Name")
+        
+        all_group_names = sorted([g['name'] for g in groups])
+        filter_group_name = col2.multiselect("Filter by Associated Group", all_group_names)
+
+    # Enrich tools with group associations
+    display_data = []
+    for t in tools:
+        # Find groups using this tool
+        associated_groups = [g['name'] for g in groups if t['id'] in g.get('tools', [])]
+        
+        # Apply Filters
+        if filter_tool_name and filter_tool_name.lower() not in t['name'].lower():
+            continue
+        
+        if filter_group_name:
+            # Check if any selected group uses this tool
+            if not any(fg in associated_groups for fg in filter_group_name):
+                continue
+
+        display_data.append({
+            "name": t['name'],
+            "type": t.get('type', 'Unknown'),
+            "groups": ", ".join(associated_groups) if associated_groups else "None"
+        })
+        
+    if display_data:
         col1, col2 = st.columns([3, 1])
         with col1:
-            st.dataframe(df[["name", "type", "description"]], use_container_width=True, height=500)
+            st.dataframe(pd.DataFrame(display_data), use_container_width=True, height=500)
         with col2:
             st.subheader("Deletion")
             tool_to_delete = st.selectbox("Select tool to delete", options=[""] + [t['name'] for t in tools])
@@ -890,6 +1014,8 @@ def render_tools():
                     t_id = next(t['id'] for t in tools if t['name'] == tool_to_delete)
                     store.delete_tool(t_id)
                     st.rerun()
+    else:
+        st.info("No tools found matching criteria.")
 
 def render_report():
     st.title("Community Report Generator (YAML)")

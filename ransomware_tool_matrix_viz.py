@@ -715,7 +715,7 @@ def render_dashboard():
             st.info("No relationships found in current selection.")
 
 def render_visualizer():
-    st.title("Ransowmare Tool Matrix Visualiser")
+    st.title("Ransomware Tool Matrix Visualiser")
     
     groups = store.get_groups()
     tools = store.get_tools()
